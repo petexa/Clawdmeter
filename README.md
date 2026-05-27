@@ -1,3 +1,23 @@
+# Clawdmeter — ESP32-S3-BOX-3 fork
+
+> **This branch (`esp32-s3-box-3`) is a port for the [Espressif ESP32-S3-BOX-3](https://github.com/espressif/esp-box).**
+> It is based on upstream Clawdmeter before the PR #25 HAL refactor, with several
+> improvements specific to this board. See [the original project](https://github.com/HermannBjorgvin/Clawdmeter) for AMOLED board support.
+
+## What's different on this branch
+
+| | Upstream | This fork |
+|---|---|---|
+| **Board** | Waveshare AMOLED 2.16 (480×480 QSPI) | ESP32-S3-BOX-3 (320×240 ILI9342C SPI) |
+| **BLE transport** | Includes HID keyboard service | HID removed — no bonding required, Linux bluez connects cleanly |
+| **BLE daemon scan** | Backgrounded `bluetoothctl scan le` (broken on headless Linux) | Piped interactive session — reliable auto-discovery |
+| **Splash screen** | Usage % overlay | Live clock: time (HH:MM) above sprite, date (Day DD Mon) below |
+| **Progress bars** | 12px flat-ended | 16px pill-shaped |
+| **Status text** | Large mono font + Unicode spinner | Clean mono font, orange, no spinner chars |
+| **Auto-rotate** | — | Cycles usage ↔ splash every 30s; manual button resets timer |
+
+---
+
 # Clawdmeter
 
 A small ESP32 dashboard I made for my desk to keep an eye on Claude Code usage.
@@ -24,6 +44,14 @@ The device boots into the splash and stays there until you press the middle (PWR
 While the splash is up, the middle button cycles animations instead of screens. The firmware also auto-rotates every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
 
 ## Hardware
+
+### This branch (ESP32-S3-BOX-3)
+
+- [Espressif ESP32-S3-BOX-3](https://github.com/espressif/esp-box) — ESP32-S3, 2.4" 320×240 ILI9342C TFT (SPI), USB-C, middle button (GPIO 1)
+- USB-C cable (flashing + power — no battery on BOX-3)
+- A Linux host with BlueZ for the daemon (tested on Proxmox LXC / Ubuntu)
+
+### Original hardware (upstream)
 
 - [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm?&aff_id=149786) - ESP32-S3R8, 2.16" 480×480 AMOLED (CO5300 QSPI), CST9220 cap touch, AXP2101 PMU + Li-Po battery, QMI8658 IMU
 - USB-C cable for flashing firmware and charging
