@@ -39,6 +39,19 @@ is_connected() {
     busctl get-property "$DBUS_DEST" "$path" org.bluez.Device1 Connected 2>/dev/null | grep -q "true"
 }
 
+# Wait until GATT service discovery completes (ServicesResolved = true)
+wait_services_resolved() {
+    local path
+    path=$(mac_to_dbus_path "$DEVICE_MAC")
+    local i
+    for i in $(seq 1 20); do
+        busctl get-property "$DBUS_DEST" "$path" org.bluez.Device1 ServicesResolved 2>/dev/null | grep -q "true" && return 0
+        sleep 1
+    done
+    log "ServicesResolved timeout"
+    return 1
+}
+
 # Load saved MAC address
 load_mac() {
     if [ -n "$DEVICE_MAC" ]; then return 0; fi
@@ -63,12 +76,10 @@ save_mac() {
 # Scan for Claude Controller
 scan_for_device() {
     log "Scanning for '$DEVICE_NAME'..."
-    # Start LE scan
-    bluetoothctl scan le &>/dev/null &
-    local scan_pid=$!
-    sleep 8
-    kill "$scan_pid" 2>/dev/null
-    wait "$scan_pid" 2>/dev/null
+    # bluetoothctl scan le in a non-interactive subshell doesn't pump D-Bus
+    # events back to bluetoothd — discovered devices never land in the cache.
+    # Piping commands into a single interactive bluetoothctl session works.
+    (echo "scan on"; sleep 10; echo "scan off"; echo "quit") | bluetoothctl &>/dev/null
 
     # Pick the first matching device. Multiple matches happen when bluez
     # remembers old hardware (e.g. after swapping ESP boards). Stale entries
@@ -188,7 +199,7 @@ write_gatt() {
     local count=${#data}
 
     busctl call "$DBUS_DEST" "$char_path" org.bluez.GattCharacteristic1 \
-        WriteValue "aya{sv}" "$count" $bytes 0 2>/dev/null
+        WriteValue "aya{sv}" "$count" $bytes 1 "type" s "command" 2>/dev/null
 }
 
 poll() {
@@ -221,19 +232,29 @@ poll() {
     s7d_reset=${s7d_reset:-0}
     status=${status:-unknown}
 
+    local th td
+    th=$(date '+%H:%M')
+    td=$(date '+%a %d %b')
+
     local payload
-    payload=$(awk -v u5="$s5h_util" -v r5="$s5h_reset" -v u7="$s7d_util" -v r7="$s7d_reset" -v st="$status" -v now="$now" \
+    payload=$(awk -v u5="$s5h_util" -v r5="$s5h_reset" -v u7="$s7d_util" -v r7="$s7d_reset" -v st="$status" -v now="$now" -v th="$th" -v td="$td" \
         'BEGIN {
             sp = sprintf("%.0f", u5 * 100);
             sr = (r5 - now) / 60; sr = sr > 0 ? sprintf("%.0f", sr) : 0;
             wp = sprintf("%.0f", u7 * 100);
             wr = (r7 - now) / 60; wr = wr > 0 ? sprintf("%.0f", wr) : 0;
-            printf "{\"s\":%s,\"sr\":%s,\"w\":%s,\"wr\":%s,\"st\":\"%s\",\"ok\":true}", sp, sr, wp, wr, st;
+            printf "{\"s\":%s,\"sr\":%s,\"w\":%s,\"wr\":%s,\"st\":\"%s\",\"th\":\"%s\",\"td\":\"%s\",\"ok\":true}", sp, sr, wp, wr, st, th, td;
         }')
 
     log "Sending: $payload"
-    write_gatt "$RX_CHAR_PATH" "$payload" || { log "Write failed"; return 1; }
-    return 0
+    local attempt
+    for attempt in 1 2 3; do
+        write_gatt "$RX_CHAR_PATH" "$payload" && return 0
+        log "Write attempt $attempt failed, retrying in 2s..."
+        sleep 2
+    done
+    log "Write failed after 3 attempts"
+    return 1
 }
 
 cleanup() {
@@ -270,6 +291,12 @@ while true; do
         }
     fi
 
+    # Wait for service discovery to complete before any GATT operations
+    wait_services_resolved || {
+        log "Service discovery timed out, reconnecting..."
+        continue
+    }
+
     # Find the GATT characteristic
     RX_CHAR_PATH=$(find_char_path_by_uuid "$RX_CHAR_UUID")
     if [ -z "$RX_CHAR_PATH" ]; then
@@ -281,19 +308,15 @@ while true; do
 
     BACKOFF=1  # reset backoff on successful connection
 
-    start_notify_subscriber
-
-    # Poll loop: tick every $TICK seconds. Poll Anthropic when the
-    # interval has elapsed OR when the ESP requested a refresh.
+    # Poll loop: tick every $TICK seconds, poll Anthropic when interval elapses.
+    # LAST_POLL=0 triggers an immediate first poll on connect.
+    # Always update LAST_POLL even on failure to avoid hammering the ATT channel.
     LAST_POLL=0
     while is_connected; do
         NOW=$(date +%s)
-        if [ -f "$REFRESH_FLAG" ] || (( NOW - LAST_POLL >= POLL_INTERVAL )); then
-            if [ -f "$REFRESH_FLAG" ]; then
-                log "Refresh requested by device"
-                rm -f "$REFRESH_FLAG"
-            fi
-            poll && LAST_POLL=$NOW
+        if (( NOW - LAST_POLL >= POLL_INTERVAL )); then
+            LAST_POLL=$NOW
+            poll
         fi
         sleep "$TICK"
     done

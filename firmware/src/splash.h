@@ -2,8 +2,12 @@
 #include <stdint.h>
 #include <lvgl.h>
 
-// Initialize splash module. Creates the canvas widget inside `parent` and
-// allocates the 480x480 pixel buffer (PSRAM).
+// Allocate the canvas pixel buffer. Call BEFORE ble_init() so BLE doesn't
+// exhaust the heap first. Returns true on success.
+bool splash_preinit(void);
+
+// Initialize splash module. Creates the canvas widget inside `parent`.
+// splash_preinit() must be called first to secure the buffer.
 void splash_init(lv_obj_t *parent);
 
 // Advance animation frame if hold time elapsed. Call from main loop.
@@ -26,3 +30,6 @@ bool splash_is_active(void);
 
 // Root container (so ui.cpp can attach a click event).
 lv_obj_t* splash_get_root(void);
+
+// Update the time/date overlays shown around the sprite.
+void splash_update_time(const char* time_h, const char* time_d);

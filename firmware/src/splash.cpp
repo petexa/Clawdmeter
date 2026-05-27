@@ -6,9 +6,10 @@
 #include <string.h>
 #include <esp_heap_caps.h>
 
-// 20x20 grid scaled 24x to fill 480x480
+// 20x20 grid scaled 8x → 160x160 canvas, centred on 320x240 display
+// (12→8 to fit in internal RAM after BLE heap init consumes ~90KB)
 #define GRID         20
-#define CELL         24
+#define CELL         8
 #define CANVAS_W     (GRID * CELL)
 #define CANVAS_H     (GRID * CELL)
 
@@ -16,10 +17,13 @@
 #define COL_EMPTY    0x0000  // true black (matches THEME_BG)
 
 LV_FONT_DECLARE(font_styrene_28);
+LV_FONT_DECLARE(font_styrene_16);
 
 static lv_obj_t *splash_container = NULL;
 static lv_obj_t *canvas = NULL;
 static lv_obj_t *label_status = NULL;     // shown only when no animations loaded
+static lv_obj_t *label_time_h = NULL;     // "14:23" above sprite
+static lv_obj_t *label_time_d = NULL;     // "Tue 27 May" below sprite
 static uint16_t *canvas_buf = NULL;        // 480x480 RGB565 (PSRAM)
 
 static uint16_t cur_anim = 0;
@@ -69,6 +73,7 @@ static void resolve_group_lists(void) {
 }
 
 static void render_frame(const uint8_t *cells, const uint16_t *palette) {
+    if (!canvas_buf) return;
     for (int gy = 0; gy < GRID; gy++) {
         uint16_t row[CANVAS_W];
         for (int gx = 0; gx < GRID; gx++) {
@@ -85,21 +90,25 @@ static void render_frame(const uint8_t *cells, const uint16_t *palette) {
 }
 
 static void show_placeholder() {
-    // Solid dark background + centered status label.
+    if (!canvas_buf) return;
     for (int i = 0; i < CANVAS_W * CANVAS_H; i++) canvas_buf[i] = COL_EMPTY;
     if (canvas) lv_obj_invalidate(canvas);
     if (label_status) lv_obj_clear_flag(label_status, LV_OBJ_FLAG_HIDDEN);
 }
 
+bool splash_preinit(void) { return true; }  // allocation now happens in splash_init()
+
 void splash_init(lv_obj_t *parent) {
-    canvas_buf = (uint16_t*)heap_caps_malloc(CANVAS_W * CANVAS_H * 2, MALLOC_CAP_SPIRAM);
+    canvas_buf = (uint16_t*)heap_caps_malloc(CANVAS_W * CANVAS_H * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    Serial.printf("splash: canvas %s (%u bytes)\n",
+                  canvas_buf ? "OK" : "FAIL", (unsigned)(CANVAS_W * CANVAS_H * 2));
     if (!canvas_buf) {
-        Serial.println("splash: failed to alloc canvas buffer");
+        resolve_group_lists();  // still needed so show() safely no-ops
         return;
     }
 
     splash_container = lv_obj_create(parent);
-    lv_obj_set_size(splash_container, 480, 480);
+    lv_obj_set_size(splash_container, 320, 240);
     lv_obj_set_pos(splash_container, 0, 0);
     lv_obj_set_style_bg_color(splash_container, THEME_BG, 0);
     lv_obj_set_style_bg_opa(splash_container, LV_OPA_COVER, 0);
@@ -132,6 +141,22 @@ void splash_init(lv_obj_t *parent) {
         render_frame(a->frames[0], a->palette);
         frame_started_ms = millis();
     }
+
+    // Time above the canvas
+    label_time_h = lv_label_create(splash_container);
+    lv_label_set_text(label_time_h, "--:--");
+    lv_obj_set_style_text_font(label_time_h, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(label_time_h, lv_color_hex(0xfaf9f5), 0);
+    lv_obj_set_style_text_align(label_time_h, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(label_time_h, LV_ALIGN_TOP_MID, 0, 6);
+
+    // Date below the canvas
+    label_time_d = lv_label_create(splash_container);
+    lv_label_set_text(label_time_d, "");
+    lv_obj_set_style_text_font(label_time_d, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(label_time_d, lv_color_hex(0xb0aea5), 0);
+    lv_obj_set_style_text_align(label_time_d, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(label_time_d, LV_ALIGN_BOTTOM_MID, 0, -8);
 
     lv_obj_add_flag(splash_container, LV_OBJ_FLAG_HIDDEN);
 }
@@ -200,4 +225,9 @@ void splash_hide(void) {
 
 lv_obj_t* splash_get_root(void) {
     return splash_container;
+}
+
+void splash_update_time(const char* time_h, const char* time_d) {
+    if (label_time_h && time_h && time_h[0]) lv_label_set_text(label_time_h, time_h);
+    if (label_time_d && time_d && time_d[0]) lv_label_set_text(label_time_d, time_d);
 }

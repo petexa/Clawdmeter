@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <lvgl.h>
+#include "driver/gpio.h"
 #include <ArduinoJson.h>
 #include "display_cfg.h"
 #include "data.h"
@@ -10,201 +11,177 @@
 #include "splash.h"
 #include "usage_rate.h"
 
-// Physical buttons (global, screen-independent):
-//   BTN_BACK   (GPIO 0)  — left,  send Space (Claude Code voice mode push-to-talk)
-//   BTN_FWD    (GPIO 18) — right, send Shift+Tab (Claude Code mode toggle)
-//   AXP PWR    (PMU)     — middle, cycle screens; on splash, cycle animations
+// Physical buttons:
+//   BTN_BACK (GPIO 0) — Boot button, hold to send Space (voice push-to-talk)
+//   BTN_MID  (GPIO 1) — Mute button, press to cycle screens (via power.cpp)
 #define BTN_BACK 0
-#define BTN_FWD  18
 
-// ---- Hardware objects ----
-Arduino_DataBus *bus = new Arduino_ESP32QSPI(
-    LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
-Arduino_CO5300 *gfx = new Arduino_CO5300(
-    bus, LCD_RESET, 0 /* rotation */,
-    LCD_WIDTH, LCD_HEIGHT, 0, 0, 0, 0);
-TouchDrvCST92xx touch;
-XPowersPMU pmu;
-SensorQMI8658 imu;
+// ---- Bit-bang SPI (bypasses ESP32 SPI peripheral entirely) ---------------
+// Hardware SPI (SPI2/SPI3) never produced any color change.
+// Bit-bang directly tests whether GPIO6/7/5/4 are wired to the display.
+
+static inline void cs_lo()   { gpio_set_level((gpio_num_t)LCD_CS,   0); }
+static inline void cs_hi()   { gpio_set_level((gpio_num_t)LCD_CS,   1); }
+static inline void dc_cmd()  { gpio_set_level((gpio_num_t)LCD_DC,   0); }
+static inline void dc_data() { gpio_set_level((gpio_num_t)LCD_DC,   1); }
+
+static void bb_send_byte(uint8_t b) {
+    for (int i = 7; i >= 0; i--) {
+        gpio_set_level((gpio_num_t)LCD_SCLK, 0);
+        gpio_set_level((gpio_num_t)LCD_MOSI, (b >> i) & 1);
+        gpio_set_level((gpio_num_t)LCD_SCLK, 1);
+    }
+    gpio_set_level((gpio_num_t)LCD_SCLK, 0);
+}
+
+static void lcd_cmd(uint8_t cmd) {
+    dc_cmd(); cs_lo();
+    bb_send_byte(cmd);
+    cs_hi();
+}
+
+static void lcd_cmd_param(uint8_t cmd, const uint8_t* d, size_t n) {
+    dc_cmd(); cs_lo();
+    bb_send_byte(cmd);
+    dc_data();
+    for (size_t i = 0; i < n; i++) bb_send_byte(d[i]);
+    cs_hi();
+}
+
+static void lcd_write_pixels(const uint8_t* px, size_t len) {
+    dc_cmd(); cs_lo();
+    bb_send_byte(0x2C);  // RAMWR
+    dc_data();
+    for (size_t i = 0; i < len; i++) bb_send_byte(px[i]);
+    cs_hi();
+}
+
+// ---- ILI9342C init -------------------------------------------------------
+
+// Minimal init compatible with both ST7789 and ILI9342C.
+// Espressif BOX-3 BSP calls esp_lcd_panel_invert_color(true) after init.
+static void lcd_init(void) {
+    // BOX-3 reset is active-HIGH (GPIO48 HIGH = assert reset, LOW = normal).
+    // Previous code had this backwards — commands were sent while in reset.
+    gpio_reset_pin((gpio_num_t)LCD_RESET);
+    gpio_set_direction((gpio_num_t)LCD_RESET, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)LCD_RESET, 1); delay(10);   // assert reset
+    gpio_set_level((gpio_num_t)LCD_RESET, 0); delay(120);  // release, stabilise
+
+    lcd_cmd(0x01); delay(150);  // SWRESET
+    lcd_cmd(0x11); delay(500);  // SLPOUT
+
+    { const uint8_t d[] = {0x55}; lcd_cmd_param(0x3A, d, 1); } // COLMOD: 16-bit RGB565
+    { const uint8_t d[] = {0xC8}; lcd_cmd_param(0x36, d, 1); } // MADCTL: MY|MX|BGR — matches BSP mirror(true,true)
+
+    lcd_cmd(0x29);  // DISPON
+    delay(100);
+}
+
+// ---- Diagnostic: fill entire screen with one color -----------------------
+// Sends CASET, RASET, then RAMWR + solid fill row-by-row.
+// Used to confirm SPI reaches the panel before LVGL starts.
+
+static void lcd_fill(uint16_t rgb565_be) {
+    { const uint8_t d[] = {0x00, 0x00, 0x01, 0x3F}; lcd_cmd_param(0x2A, d, 4); }
+    { const uint8_t d[] = {0x00, 0x00, 0x00, 0xEF}; lcd_cmd_param(0x2B, d, 4); }
+    uint8_t hi = rgb565_be >> 8, lo = rgb565_be & 0xFF;
+    dc_cmd(); cs_lo();
+    bb_send_byte(0x2C);  // RAMWR
+    dc_data();
+    for (int r = 0; r < 240; r++)
+        for (int c = 0; c < 320; c++) { bb_send_byte(hi); bb_send_byte(lo); }
+    cs_hi();
+}
+
+// ---- Touch driver object (init skipped — GPIO48 conflict with LCD_RESET) --
+TouchDrvGT911 touch;
 
 static UsageData usage = {};
 
-// ---- Touch interrupt + shared state ----
+// Touch state (no ISR — touch not yet initialized)
 static volatile bool     touch_pressed = false;
 static volatile uint16_t touch_x = 0;
 static volatile uint16_t touch_y = 0;
-static volatile bool     touch_data_ready = false;
 
-static void IRAM_ATTR touch_isr(void) {
-    touch_data_ready = true;
-}
-
-static void touch_read() {
-    if (!touch_data_ready) return;
-    touch_data_ready = false;
-
-    int16_t tx[5], ty[5];
-    uint8_t n = touch.getPoint(tx, ty, touch.getSupportTouchPoint());
-    if (n > 0) {
-        touch_pressed = true;
-        touch_x = (uint16_t)tx[0];
-        touch_y = (uint16_t)ty[0];
-    } else {
-        touch_pressed = false;
-    }
-}
-
-// ---- LVGL draw buffers (PSRAM-backed, partial render) ----
-#define BUF_LINES 40
+// ---- LVGL render buffers (PSRAM-backed, partial render) ------------------
+#define BUF_LINES 20
 static uint16_t *buf1 = nullptr;
 static uint16_t *buf2 = nullptr;
-// rot_buf for strip rotation — max size is 480×480 (full invalidation case)
-// but typical partial strips are much smaller
-static uint16_t *rot_buf = nullptr;
 
-// LVGL tick callback
-static uint32_t my_tick(void) {
-    return millis();
-}
+static uint32_t my_tick(void) { return millis(); }
 
-// Rotate a w×h strip and compute destination coordinates on the 480×480 display.
-// src pixels are in row-major order for the rectangle (sx, sy, w, h).
-// Output goes to rot_buf in row-major order for the destination rectangle.
-static void rotate_strip(const uint16_t *src, int32_t w, int32_t h,
-                         int32_t sx, int32_t sy, uint8_t r,
-                         int32_t *dx, int32_t *dy, int32_t *dw, int32_t *dh) {
-    const int S = LCD_WIDTH;  // 480
+// ---- LVGL flush via raw SPI ----------------------------------------------
 
-    switch (r) {
-    case 1: { // 90° CW: (x,y) -> (S-1-y, x)
-        *dw = h; *dh = w;
-        *dx = S - sy - h;
-        *dy = sx;
-        for (int32_t y = 0; y < h; y++) {
-            for (int32_t x = 0; x < w; x++) {
-                // src(x,y) -> dst(h-1-y, x)
-                rot_buf[x * h + (h - 1 - y)] = src[y * w + x];
-            }
-        }
-        break;
-    }
-    case 2: { // 180°: (x,y) -> (S-1-x, S-1-y)
-        *dw = w; *dh = h;
-        *dx = S - sx - w;
-        *dy = S - sy - h;
-        for (int32_t y = 0; y < h; y++) {
-            for (int32_t x = 0; x < w; x++) {
-                rot_buf[(h - 1 - y) * w + (w - 1 - x)] = src[y * w + x];
-            }
-        }
-        break;
-    }
-    case 3: { // 270° CW: (x,y) -> (y, S-1-x)
-        *dw = h; *dh = w;
-        *dx = sy;
-        *dy = S - sx - w;
-        for (int32_t y = 0; y < h; y++) {
-            for (int32_t x = 0; x < w; x++) {
-                // src(x,y) -> dst(y, w-1-x)
-                rot_buf[(w - 1 - x) * h + y] = src[y * w + x];
-            }
-        }
-        break;
-    }
-    default:
-        *dx = sx; *dy = sy; *dw = w; *dh = h;
-        break;
-    }
-}
+static int flush_count = 0;
 
-// LVGL flush callback — rotates partial strips and writes to display
-static void my_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) {
-    int32_t w = area->x2 - area->x1 + 1;
-    int32_t h = area->y2 - area->y1 + 1;
-    uint16_t *src = (uint16_t*)px_map;
-    uint8_t r = imu_get_rotation();
-
-    if (r == 0) {
-        gfx->draw16bitRGBBitmap(area->x1, area->y1, src, w, h);
-    } else {
-        int32_t dx, dy, dw, dh;
-        rotate_strip(src, w, h, area->x1, area->y1, r, &dx, &dy, &dw, &dh);
-        gfx->draw16bitRGBBitmap(dx, dy, rot_buf, dw, dh);
+static void my_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
+    const int32_t x1 = area->x1, y1 = area->y1, x2 = area->x2, y2 = area->y2;
+    if (flush_count < 5) {
+        Serial.printf("flush#%d (%d,%d)-(%d,%d)\n", flush_count, x1, y1, x2, y2);
+        flush_count++;
     }
+
+    const uint8_t caset[4] = {(uint8_t)(x1>>8),(uint8_t)x1,(uint8_t)(x2>>8),(uint8_t)x2};
+    const uint8_t raset[4] = {(uint8_t)(y1>>8),(uint8_t)y1,(uint8_t)(y2>>8),(uint8_t)y2};
+    lcd_cmd_param(0x2A, caset, 4);
+    lcd_cmd_param(0x2B, raset, 4);
+    lcd_write_pixels(px_map, (size_t)(x2 - x1 + 1) * (y2 - y1 + 1) * 2);
+
     lv_display_flush_ready(disp);
 }
 
-// CO5300 requires even-aligned flush regions
-static void rounder_cb(lv_event_t* e) {
-    lv_area_t *area = (lv_area_t*)lv_event_get_param(e);
-    area->x1 = area->x1 & ~1;
-    area->y1 = area->y1 & ~1;
-    area->x2 = area->x2 | 1;
-    area->y2 = area->y2 | 1;
-}
-
-// LVGL touch callback
-static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
+static void my_touch_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     if (touch_pressed) {
         data->point.x = touch_x;
         data->point.y = touch_y;
-        data->state = LV_INDEV_STATE_PRESSED;
+        data->state   = LV_INDEV_STATE_PRESSED;
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
     }
 }
 
-// Parse a JSON line into UsageData
-static bool parse_json(const char* json, UsageData* out) {
+// ---- JSON parse ----------------------------------------------------------
+
+static bool parse_json(const char *json, UsageData *out) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
-    if (err) {
-        Serial.printf("JSON parse error: %s\n", err.c_str());
-        return false;
-    }
-
-    out->session_pct = doc["s"] | 0.0f;
+    if (err) { Serial.printf("JSON parse error: %s\n", err.c_str()); return false; }
+    out->session_pct        = doc["s"]  | 0.0f;
     out->session_reset_mins = doc["sr"] | -1;
-    out->weekly_pct = doc["w"] | 0.0f;
-    out->weekly_reset_mins = doc["wr"] | -1;
+    out->weekly_pct         = doc["w"]  | 0.0f;
+    out->weekly_reset_mins  = doc["wr"] | -1;
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
-    out->ok = doc["ok"] | false;
+    strlcpy(out->time_h, doc["th"] | "",        sizeof(out->time_h));
+    strlcpy(out->time_d, doc["td"] | "",        sizeof(out->time_d));
+    out->ok    = doc["ok"] | false;
     out->valid = true;
     return true;
 }
 
-// Serial command buffer
+// ---- Serial command: screenshot ------------------------------------------
+
 #define CMD_BUF_SIZE 64
 static char cmd_buf[CMD_BUF_SIZE];
-static int cmd_pos = 0;
+static int  cmd_pos = 0;
 
 static void send_screenshot() {
     const uint32_t w = LCD_WIDTH, h = LCD_HEIGHT;
-    const uint32_t row_bytes = w * 2;
-    const uint32_t buf_size = row_bytes * h;
-    uint8_t* sbuf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
-    if (!sbuf) {
-        Serial.println("SCREENSHOT_ERR");
-        return;
-    }
-
+    const uint32_t buf_size = w * h * 2;
+    uint8_t *sbuf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!sbuf) { Serial.println("SCREENSHOT_ERR"); return; }
     lv_draw_buf_t draw_buf;
-    lv_draw_buf_init(&draw_buf, w, h, LV_COLOR_FORMAT_RGB565, row_bytes, sbuf, buf_size);
-
-    lv_result_t res = lv_snapshot_take_to_draw_buf(lv_screen_active(), LV_COLOR_FORMAT_RGB565, &draw_buf);
-    if (res != LV_RESULT_OK) {
-        heap_caps_free(sbuf);
-        Serial.println("SCREENSHOT_ERR");
-        return;
-    }
-
-    Serial.printf("SCREENSHOT_START %lu %lu %lu\n", (unsigned long)w, (unsigned long)h, (unsigned long)buf_size);
+    lv_draw_buf_init(&draw_buf, w, h, LV_COLOR_FORMAT_RGB565, w * 2, sbuf, buf_size);
+    lv_result_t res = lv_snapshot_take_to_draw_buf(lv_screen_active(),
+                                                    LV_COLOR_FORMAT_RGB565, &draw_buf);
+    if (res != LV_RESULT_OK) { heap_caps_free(sbuf); Serial.println("SCREENSHOT_ERR"); return; }
+    Serial.printf("SCREENSHOT_START %lu %lu %lu\n",
+                  (unsigned long)w, (unsigned long)h, (unsigned long)buf_size);
     Serial.flush();
     Serial.write(sbuf, buf_size);
     Serial.flush();
     Serial.println();
     Serial.println("SCREENSHOT_END");
-
     heap_caps_free(sbuf);
 }
 
@@ -213,9 +190,8 @@ static void check_serial_cmd() {
         char c = Serial.read();
         if (c == '\n' || c == '\r') {
             cmd_buf[cmd_pos] = '\0';
-            if (strcmp(cmd_buf, "screenshot") == 0) {
-                send_screenshot();
-            }
+            if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
+            else if (strcmp(cmd_buf, "clearbonds") == 0) { ble_clear_bonds(); Serial.println("bonds cleared"); }
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
@@ -223,115 +199,92 @@ static void check_serial_cmd() {
     }
 }
 
+// ---- setup ---------------------------------------------------------------
+
 void setup() {
     Serial.begin(115200);
     delay(300);
     Serial.println("{\"ready\":true}");
 
-    // Init I2C (shared by touch + PMU)
     Wire.begin(IIC_SDA, IIC_SCL);
-
-    // Init display
-    gfx->begin();
-    gfx->fillScreen(0x0000);
-    gfx->setBrightness(200);
-
-    // Init PMU
     power_init();
-
-    // Init IMU (accelerometer for auto-rotation)
     imu_init();
 
-    // Init touch
-    touch.setPins(TP_RST, TP_INT);
-    if (!touch.begin(Wire, CST9220_ADDR, IIC_SDA, IIC_SCL)) {
-        Serial.println("Touch init failed");
-    } else {
-        touch.setMaxCoordinates(LCD_WIDTH, LCD_HEIGHT);
-        touch.setSwapXY(true);
-        touch.setMirrorXY(true, false);
-        attachInterrupt(TP_INT, touch_isr, FALLING);
-        Serial.println("Touch init OK");
-    }
+    // Release LCD SPI pins from PSRAM SPI0 IO MUX — Espressif BSP does this
+    // explicitly; without it gpio_set_level is silently ignored on GPIO4-7.
+    gpio_reset_pin((gpio_num_t)LCD_CS);
+    gpio_reset_pin((gpio_num_t)LCD_DC);
+    gpio_reset_pin((gpio_num_t)LCD_MOSI);
+    gpio_reset_pin((gpio_num_t)LCD_SCLK);
 
-    // Init LVGL
+    // Manual CS and DC GPIO setup (SPI device uses spics_io_num = -1)
+    gpio_set_direction((gpio_num_t)LCD_CS, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)LCD_DC, GPIO_MODE_OUTPUT);
+    cs_hi();     // CS idle HIGH
+    dc_data();   // DC idle HIGH (data)
+
+    // Bit-bang SPI — MOSI and SCLK as outputs (CS and DC already configured above)
+    gpio_set_direction((gpio_num_t)LCD_MOSI, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)LCD_SCLK, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)LCD_SCLK, 0);
+    gpio_set_level((gpio_num_t)LCD_MOSI, 0);
+    // Display hardware init (ST7789 / ILI9342C minimal sequence)
+    lcd_init();
+    Serial.println("LCD init OK");
+
+    // Backlight ON
+    gpio_config_t bl_cfg = {};
+    bl_cfg.pin_bit_mask = (1ULL << LCD_BL);
+    bl_cfg.mode         = GPIO_MODE_OUTPUT;
+    gpio_config(&bl_cfg);
+    gpio_set_level((gpio_num_t)LCD_BL, 1);
+    Serial.printf("BL GPIO%d HIGH\n", LCD_BL);
+    delay(50);
+
+    // ---- Diagnostic fill ------------------------------------------------
+    // RED  = 0xF800 (RGB565 big-endian). Expect:
+    //   - RED on screen  → INVON working, SPI OK
+    //   - CYAN on screen → SPI OK, INVON not applied (panel inverted)
+    //   - WHITE          → SPI not reaching panel at all
+    Serial.println("DIAG: red fill");
+    lcd_fill(0xF800);
+    delay(3000);
+
+    // Clear to black before LVGL takes over
+    lcd_fill(0x0000);
+    // ---- End diagnostic --------------------------------------------------
+
+    // LVGL
     lv_init();
     lv_tick_set_cb(my_tick);
 
-    // Allocate PSRAM-backed partial render buffers
-    buf1 = (uint16_t*)heap_caps_malloc(LCD_WIDTH * BUF_LINES * 2, MALLOC_CAP_SPIRAM);
-    buf2 = (uint16_t*)heap_caps_malloc(LCD_WIDTH * BUF_LINES * 2, MALLOC_CAP_SPIRAM);
-    // rot_buf needs to hold the largest possible strip after rotation
-    // A 480×40 strip rotated 90° becomes 40×480, same pixel count
-    rot_buf = (uint16_t*)heap_caps_malloc(LCD_WIDTH * BUF_LINES * 2, MALLOC_CAP_SPIRAM);
+    buf1 = (uint16_t*)heap_caps_malloc(LCD_WIDTH * BUF_LINES * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    buf2 = (uint16_t*)heap_caps_malloc(LCD_WIDTH * BUF_LINES * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    Serial.printf("buf1=%p buf2=%p\n", buf1, buf2);
 
-    lv_display_t* disp = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
-    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
-    lv_display_set_flush_cb(disp, my_flush_cb);
-    lv_display_set_buffers(disp, buf1, buf2, LCD_WIDTH * BUF_LINES * 2,
+    lv_display_t *lvgl_disp = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
+    // RGB565_SWAPPED = big-endian byte order; ILI9342C expects MSB first over SPI
+    lv_display_set_color_format(lvgl_disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
+    lv_display_set_flush_cb(lvgl_disp, my_flush_cb);
+    lv_display_set_buffers(lvgl_disp, buf1, buf2, LCD_WIDTH * BUF_LINES * 2,
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
 
-    // CO5300 even-alignment rounder
-    lv_display_add_event_cb(disp, rounder_cb, LV_EVENT_INVALIDATE_AREA, NULL);
-
-    lv_indev_t* indev = lv_indev_create();
+    lv_indev_t *indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touch_cb);
 
-    // Init BLE data channel
     ble_init();
-
-    // Physical buttons: back (GPIO 0) and forward (GPIO 18)
     pinMode(BTN_BACK, INPUT_PULLUP);
-    pinMode(BTN_FWD,  INPUT_PULLUP);
 
-    // Build dashboard
     ui_init();
-
-    // Show initial BLE status on Bluetooth screen
     ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
-
-    // Show initial battery status
     ui_update_battery(power_battery_pct(), power_is_charging());
-
-    ui_show_screen(SCREEN_SPLASH);
+    ui_show_screen(SCREEN_USAGE);
 
     Serial.println("Dashboard ready, waiting for data on BLE...");
 }
 
-static ble_state_t last_ble_state = BLE_STATE_INIT;
-
-// Brightness ramp state for rotation transition
-// On rotation change we blank the panel, force a full LVGL redraw at the
-// new orientation, then ramp brightness back up over ~125ms so the
-// transition reads as deliberate instead of as a glitch.
-static void handle_rotation_change(void) {
-    static uint8_t last_rotation = 0;
-    static uint8_t  ramp_step = 0;  // 0=idle, 1-4=ramping
-    static uint32_t ramp_last = 0;
-
-    uint8_t rot = imu_get_rotation();
-    if (rot != last_rotation) {
-        gfx->setBrightness(0);
-        last_rotation = rot;
-        lv_obj_invalidate(lv_screen_active());
-        ramp_step = 1;
-        return;
-    }
-
-    if (ramp_step == 0) return;
-    uint32_t now = millis();
-    if (now - ramp_last < 25) return;
-    ramp_last = now;
-
-    static const uint8_t levels[] = {60, 120, 170, 200};
-    gfx->setBrightness(levels[ramp_step - 1]);
-    if (ramp_step >= 4) ramp_step = 0;
-    else                ramp_step++;
-}
-
 void loop() {
-    touch_read();
     lv_timer_handler();
     ui_tick_anim();
     ble_tick();
@@ -339,56 +292,51 @@ void loop() {
     imu_tick();
     splash_tick();
 
-    // Three-button input (global, screen-independent):
-    //   LEFT  (GPIO 0)  → Space (voice-mode push-to-talk; press & release tracked)
-    //   RIGHT (GPIO 18) → Shift+Tab (Claude Code mode toggle)
-    //   PWR   (AXP)     → cycle screens; on splash, cycle animations
-    {
-        static bool back_was = false, fwd_was = false;
-        bool back_now = (digitalRead(BTN_BACK) == LOW);
-        bool fwd_now  = (digitalRead(BTN_FWD)  == LOW);
+    static uint32_t last_auto_toggle = 0;
 
+    {
+        static bool back_was = false;
+        bool back_now = (digitalRead(BTN_BACK) == LOW);
         if (back_now != back_was) {
-            if (back_now) ble_keyboard_press(0x2C, 0);  // HID Space, no mods
+            if (back_now) ble_keyboard_press(0x2C, 0);
             else          ble_keyboard_release();
             back_was = back_now;
         }
-        if (fwd_now != fwd_was) {
-            if (fwd_now) ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
-            else         ble_keyboard_release();
-            fwd_was = fwd_now;
-        }
-
         if (power_pwr_pressed()) {
-            if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
-            else                                          ui_cycle_screen();
+            ui_toggle_splash();
+            last_auto_toggle = millis();
         }
     }
 
-    handle_rotation_change();
+    // Auto-switch between usage and splash every 30s
+    {
+        const uint32_t AUTO_TOGGLE_MS = 30000;
+        uint32_t now = millis();
+        if (now - last_auto_toggle >= AUTO_TOGGLE_MS) {
+            last_auto_toggle = now;
+            ui_toggle_splash();
+        }
+    }
 
-    // Update BLE status on screen when state changes
+    static ble_state_t last_ble_state = BLE_STATE_INIT;
     ble_state_t bs = ble_get_state();
     if (bs != last_ble_state) {
         last_ble_state = bs;
         ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
     }
 
-    // Update battery indicator
-    static int last_pct = -2;
+    static int  last_pct      = -2;
     static bool last_charging = false;
-    int pct = power_battery_pct();
+    int  pct      = power_battery_pct();
     bool charging = power_is_charging();
     if (pct != last_pct || charging != last_charging) {
-        last_pct = pct;
+        last_pct      = pct;
         last_charging = charging;
         ui_update_battery(pct, charging);
     }
 
-    // Check for serial commands (screenshot, etc.)
     check_serial_cmd();
 
-    // Process incoming BLE data
     if (ble_has_data()) {
         if (parse_json(ble_get_data(), &usage)) {
             int g_before = usage_rate_group();
